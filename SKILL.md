@@ -33,7 +33,7 @@ python3 /absolute/path/to/osv-uv-scan/scripts/osv-scan.py /absolute/path/to/proj
 
 The script writes one JSON document to stdout and progress lines to stderr. It does not modify the project.
 
-The runtime check uses the interpreter in `.venv/pyvenv.cfg` beside each `uv.lock`. Without a venv it uses the Python that runs the script. To check the Python the project deploys on, such as the one in its Docker image, pass an exact version:
+The runtime check uses the interpreter in `.venv/pyvenv.cfg` beside each `uv.lock`. When no lockfile has a venv, it uses the Python that runs the script. When some do, the others are listed in `runtime.lockfilesWithoutVenv` and no interpreter is checked for them. To check the Python the project deploys on, such as the one in its Docker image, pass an exact version:
 
 ```bash
 python3 /absolute/path/to/osv-uv-scan/scripts/osv-scan.py /absolute/path/to/project --python-version 3.12.3
@@ -80,11 +80,11 @@ Mention dev-only CRITICAL and HIGH findings in a short paragraph after the produ
 Then the runtime, in its own short section:
 
 - Name each interpreter checked, its `source`, and its `build`. When the source is `process`, say this is the Python that ran the scan, and may not be what the project runs on
-- For an upstream build with `vulnerable` true: the advisory count, the worst `severity`, how many patch releases it is behind, and `upgradeTo`. When `fixedInLine` is false, upgrading within the line does not fix that advisory. Say so. An `inferred` advisory was found on the next patch release and added back because OSV misses some release tags
+- For an upstream build with `vulnerable` true: the advisory count, the worst `severity`, how many advisories are `UNKNOWN`, how many patch releases it is behind, and `upgradeTo`. Many PSF advisories carry only CVSS v4, so `UNKNOWN` is common and the worst severity alone understates the risk. When `fixedInLine` is false, upgrading within the line does not fix that advisory. Say so. An `inferred` advisory was found on the next patch release and added back because OSV misses some release tags
 - For a distro build: the count, and how many have `fixAvailable` true, which means a newer distro package fixes them (`apt upgrade`). The rest have no released fix yet. Do not suggest a python.org patch version for a distro build
 - For a line that is end of life, in an interpreter or a target, say it is unsupported whatever the advisory count. Recommend `runtime.recommendedLine`. A `requires-python` minimum on an end-of-life line means the project still claims to support it
 - Severity comes from CVSS v3 or the distro's priority. Records with only CVSS v4 show `UNKNOWN`. Advisories have no platform data, so a Windows-only issue is listed on Linux too. Say that once when it matters
-- When an interpreter has `error` or `note`, say it was not checked and why
+- When an interpreter has `error` or `note`, say it was not checked and why. Name `lockfilesWithoutVenv` in one line
 
 This is a lockfile match against known advisories. It does not show whether the vulnerable code runs. Say that once.
 

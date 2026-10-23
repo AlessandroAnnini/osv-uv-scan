@@ -928,6 +928,8 @@ def scan_runtime(root, lock_rels, python_version=None):
             checked.append({**base, "version": item["version"], "error": f"not checked: {err}"})
     targets = [{**target, **({} if not target["line"] else line_status(target["line"], cycle))} for target in project_targets(root, lock_rels)]
     decided = [item.get("vulnerable") for item in checked if "vulnerable" in item]
+    venv_dirs = {str(Path(item["venv"]).parent) for item in checked if item.get("venv")}
+    without = [rel for rel in lock_rels if venv_dirs and str(Path(rel).parent) not in venv_dirs]
     runtime = {
         "name": "python",
         "recommendedLine": recommended_line(cycle),
@@ -935,6 +937,8 @@ def scan_runtime(root, lock_rels, python_version=None):
         "interpreters": checked,
         "targets": targets,
     }
+    if without:
+        runtime["lockfilesWithoutVenv"] = without
     return runtime, [f"python runtime {item['version']}: {item['error']}" for item in checked if item.get("error")]
 
 

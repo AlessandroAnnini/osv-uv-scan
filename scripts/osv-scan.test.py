@@ -461,6 +461,20 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual([(item["kind"], item["line"]) for item in targets], [("python-version", "3.11"), ("requires-python", "3.9")])
         self.assertIsNone(scan.read_pyvenv("/nonexistent/pyvenv.cfg"))
 
+    def test_a_network_failure_leaves_an_error_and_a_warning(self):
+        original = scan.request_json
+
+        def offline(url, payload=None):
+            raise RuntimeError("offline")
+
+        scan.request_json = offline
+        try:
+            runtime, warnings = scan.scan_runtime(Path("/nonexistent"), [], None)
+        finally:
+            scan.request_json = original
+        self.assertIn("offline", runtime["error"])
+        self.assertEqual(warnings, [runtime["error"]])
+
     def test_python_version_flag_is_read_in_either_form(self):
         self.assertEqual(scan.parse_args(["/p", "--python-version", "3.12.3"]), {"root": "/p", "python_version": "3.12.3"})
         self.assertEqual(scan.parse_args(["--python-version=3.11.0", "/p"]), {"root": "/p", "python_version": "3.11.0"})

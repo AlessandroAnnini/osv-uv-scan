@@ -70,6 +70,7 @@ A skipped lockfile, an unreadable directory, or a non-registry install does not 
 | `vulnerable` | True when any checked interpreter is vulnerable. Null when none could be checked |
 | `interpreters` | One entry per interpreter. See below |
 | `targets` | `.python-version` and `requires-python` entries. See below |
+| `lockfilesWithoutVenv` | Present when some lockfiles have a `.venv` and these do not. No interpreter was checked for them. When no lockfile has a venv, the Python running the script is checked instead |
 | `error` | Present instead of the result fields when python.org or peps.python.org could not be fetched. The package scan still completes |
 
 Interpreter entry, always: `source` (`venv` from `.venv/pyvenv.cfg`, `flag` for `--python-version`, or `process` for the Python running the script), `venv` when the source is `venv`, `version`, `build` (`upstream` or `distro`), `releaseLine`, `supportPhase` (`feature`, `prerelease`, `bugfix`, `security`, or `end-of-life`), `endOfLife` (from the phase, null when the line is unknown), `endOfLifeDate` (a day for past dates, often only a month for future ones), `vulnerable`, and `advisories`. An entry that could not be checked has `error` or `note` instead of the result fields. A version that is not a published CPython release is an error, because OSV returns nothing for a tag it does not know.
