@@ -354,5 +354,118 @@ class ScanTests(unittest.TestCase):
             self.assertEqual(warnings, [])
 
 
+RELEASES = [{"name": f"Python 3.12.{patch}", "pre_release": False} for patch in range(0, 4)] + [
+    {"name": "Python 3.13.0rc1", "pre_release": True},
+    {"name": "Python 3.9.25", "pre_release": False},
+]
+CYCLE = {
+    "3.13": {"status": "bugfix", "end_of_life": "2029-10"},
+    "3.12": {"status": "security", "end_of_life": "2028-10"},
+    "3.9": {"status": "end-of-life", "end_of_life": "2025-10-31"},
+}
+
+
+def cve(number, psf=None, vector=None):
+    record = {"id": f"CVE-2026-{number}", "aliases": [psf] if psf else [], "summary": f"issue {number}"}
+    if vector:
+        record["severity"] = [{"type": "CVSS_V3", "score": vector}]
+    return record
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_published_versions_drop_prereleases_and_odd_names(self):
+        self.assertEqual(scan.published_versions(RELEASES)[-1], (3, 12, 3))
+        self.assertNotIn((3, 13, 0), scan.published_versions(RELEASES))
+
+    def test_line_status_uses_the_status_and_keeps_a_month_date(self):
+        self.assertEqual(scan.line_status("3.12", CYCLE)["endOfLife"], False)
+        self.assertEqual(scan.line_status("3.12", CYCLE)["endOfLifeDate"], "2028-10")
+        self.assertEqual(scan.line_status("3.9", CYCLE)["endOfLife"], True)
+        self.assertIsNone(scan.line_status("2.1", CYCLE)["endOfLife"])
+        self.assertEqual(scan.recommended_line(CYCLE), "3.13")
+
+    def test_cve_and_psf_records_collapse_with_the_cve_id_first(self):
+        records = [{"id": "PSF-2026-1", "aliases": ["CVE-2026-1"], "summary": "psf text"}, cve(1, vector=HIGH_VECTOR)]
+        groups = scan.group_records(records)
+        self.assertEqual(len(groups), 1)
+        item = scan.summarize_runtime_group(groups[0])
+        self.assertEqual(item["id"], "CVE-2026-1")
+        self.assertEqual(item["aliases"], ["PSF-2026-1"])
+        self.assertEqual(item["severity"], "HIGH")
+
+    def test_an_unknown_tag_is_an_error_not_a_clean_result(self):
+        result = scan.check_upstream("3.12.99", RELEASES, CYCLE, query=lambda tag: [])
+        self.assertIn("not a published", result["error"])
+        self.assertNotIn("vulnerable", result)
+
+    def test_upstream_adds_back_cves_the_next_patch_still_has(self):
+        tags = {
+            "v3.12.1": [cve(1)],
+            "v3.12.2": [cve(1), cve(2)],
+            "v3.12.3": [cve(2)],
+        }
+        result = scan.check_upstream("3.12.1", RELEASES, CYCLE, query=lambda tag: tags[tag])
+        by_id = {item["id"]: item for item in result["advisories"]}
+        self.assertEqual(sorted(by_id), ["CVE-2026-1", "CVE-2026-2"])
+        self.assertTrue(by_id["CVE-2026-2"]["inferred"])
+        self.assertFalse(by_id["CVE-2026-2"]["fixedInLine"], "still present in the latest patch")
+        self.assertTrue(by_id["CVE-2026-1"]["fixedInLine"])
+        self.assertEqual(result["missedPatchReleases"], ["3.12.2", "3.12.3"])
+        self.assertEqual(result["upgradeTo"], "3.12.3")
+        self.assertTrue(result["vulnerable"])
+
+    def test_missed_patches_on_a_security_only_line_count_without_cves(self):
+        result = scan.check_upstream("3.12.2", RELEASES, CYCLE, query=lambda tag: [])
+        self.assertEqual(result["advisories"], [])
+        self.assertTrue(result["vulnerable"])
+        latest = scan.check_upstream("3.12.3", RELEASES, CYCLE, query=lambda tag: [])
+        self.assertFalse(latest["vulnerable"])
+        self.assertIsNone(latest["upgradeTo"])
+
+    def test_distro_build_splits_released_fixes_and_rejects_an_unknown_package(self):
+        eco, pkg = "Ubuntu:24.04:LTS", "python3.12"
+
+        def record(number, fixed):
+            events = [{"introduced": "0"}] + ([{"fixed": "3.12.3-1ubuntu0.18"}] if fixed else [])
+            return {
+                "id": f"UBUNTU-CVE-2026-{number}",
+                "aliases": [f"CVE-2026-{number}"],
+                "severity": [{"type": "Ubuntu", "score": "medium"}],
+                "affected": [{"package": {"ecosystem": eco, "name": pkg}, "ranges": [{"type": "ECOSYSTEM", "events": events}]}],
+            }
+
+        rows = [record(1, True), record(2, False)]
+        result = scan.check_distro("3.12.3", pkg, "3.12.3-1ubuntu0.17", eco, CYCLE, query=lambda version: rows)
+        by_id = {item["id"]: item for item in result["advisories"]}
+        self.assertTrue(by_id["CVE-2026-1"]["fixAvailable"])
+        self.assertFalse(by_id["CVE-2026-2"]["fixAvailable"])
+        self.assertEqual(by_id["CVE-2026-1"]["severity"], "MEDIUM")
+        unknown = scan.check_distro("3.12.3", pkg, "x", eco, CYCLE, query=lambda version: [])
+        self.assertIn("no records", unknown["error"])
+
+    def test_distro_ecosystem_names_follow_os_release(self):
+        ubuntu = scan.os_release('ID=ubuntu\nVERSION_ID="24.04"\nVERSION="24.04.5 LTS (Noble Numbat)"\n')
+        self.assertEqual(scan.distro_ecosystem(ubuntu), "Ubuntu:24.04:LTS")
+        self.assertEqual(scan.distro_ecosystem({"ID": "debian", "VERSION_ID": "12"}), "Debian:12")
+        self.assertIsNone(scan.distro_ecosystem({"ID": "fedora", "VERSION_ID": "40"}))
+
+    def test_venv_config_and_project_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".venv").mkdir()
+            (root / ".venv" / "pyvenv.cfg").write_text("home = /opt/py/bin\nimplementation = CPython\nversion_info = 3.11.12\n")
+            self.assertEqual(scan.read_pyvenv(root / ".venv" / "pyvenv.cfg")["version"], "3.11.12")
+            (root / "uv.lock").write_text('version = 1\nrequires-python = ">=3.9, <4"\n')
+            (root / ".python-version").write_text("# pinned\n3.11\n")
+            targets = scan.project_targets(root, ["uv.lock"])
+            self.assertEqual([(item["kind"], item["line"]) for item in targets], [("python-version", "3.11"), ("requires-python", "3.9")])
+        self.assertIsNone(scan.read_pyvenv("/nonexistent/pyvenv.cfg"))
+
+    def test_python_version_flag_is_read_in_either_form(self):
+        self.assertEqual(scan.parse_args(["/p", "--python-version", "3.12.3"]), {"root": "/p", "python_version": "3.12.3"})
+        self.assertEqual(scan.parse_args(["--python-version=3.11.0", "/p"]), {"root": "/p", "python_version": "3.11.0"})
+        self.assertEqual(scan.parse_args([]), {"root": None, "python_version": None})
+
+
 if __name__ == "__main__":
     unittest.main()

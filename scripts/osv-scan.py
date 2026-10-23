@@ -6,6 +6,7 @@ Stdout is one JSON document. Progress goes to stderr. No dependencies.
 
 import json
 import re
+import subprocess
 import sys
 import time
 import tomllib
@@ -25,6 +26,9 @@ FETCH_WORKERS = 12
 RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", "site-packages"}
 LOCK_NAMES = {"uv.lock"}
+CPYTHON_REPO = "github.com/python/cpython"
+PYTHON_RELEASES = "https://www.python.org/api/v2/downloads/release/?is_published=true"
+PYTHON_CYCLE = "https://peps.python.org/api/release-cycle.json"
 _PRE_RANK = {
     "a": 0,
     "alpha": 0,
@@ -626,6 +630,327 @@ def _fetch_record(vuln_id):
     return vuln_id, request_json(f"{API}/vulns/{quote(vuln_id, safe='')}")
 
 
+def _triple(text):
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text).strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _dotted(version):
+    return ".".join(str(part) for part in version)
+
+
+def published_versions(releases):
+    """Final CPython releases from the python.org API, as (major, minor, patch) tuples."""
+    found = set()
+    for release in releases or []:
+        if release.get("pre_release"):
+            continue
+        match = re.fullmatch(r"Python (\d+)\.(\d+)\.(\d+)", str(release.get("name", "")))
+        if match:
+            found.add(tuple(int(part) for part in match.groups()))
+    return sorted(found)
+
+
+def line_status(line, cycle):
+    """Support phase of a release line such as "3.12" from release-cycle.json.
+
+    end_of_life is a month ("2026-10") for future dates, so status decides end of life."""
+    entry = (cycle or {}).get(line)
+    if not entry:
+        return {"releaseLine": line, "supportPhase": None, "endOfLife": None, "endOfLifeDate": None}
+    return {
+        "releaseLine": line,
+        "supportPhase": entry.get("status"),
+        "endOfLife": entry.get("status") == "end-of-life",
+        "endOfLifeDate": entry.get("end_of_life"),
+    }
+
+
+def recommended_line(cycle):
+    lines = [line for line, entry in (cycle or {}).items() if entry.get("status") == "bugfix"]
+    return max(lines, key=lambda line: tuple(int(part) for part in line.split(".")), default=None)
+
+
+def _osv_query_all(package, version):
+    vulns, token, pages = [], None, 0
+    while True:
+        payload = {"package": package}
+        if version is not None:
+            payload["version"] = version
+        if token:
+            payload["page_token"] = token
+        page = request_json(f"{API}/query", payload)
+        vulns.extend(page.get("vulns") or [])
+        token = page.get("next_page_token")
+        pages += 1
+        if not token or pages > PAGE_LIMIT:
+            return vulns
+
+
+def _distro_label(record):
+    for item in record.get("severity") or []:
+        if item.get("type") in {"Ubuntu", "Debian"} and isinstance(item.get("score"), str):
+            label = item["score"].strip().upper()
+            if label in RANK:
+                return label
+    return None
+
+
+def summarize_runtime_group(group):
+    """One CPython advisory. The CVE id leads when there is one, then PSF."""
+    ids = sorted({alias for record in group for alias in [record.get("id"), *(record.get("aliases") or [])] if alias})
+    primary_id = next((i for i in ids if i.startswith("CVE-")), None) or next((i for i in ids if i.startswith("PSF-")), ids[0])
+    primary = next((record for record in group if record.get("id") == primary_id), None)
+    summary = next((record.get("summary") for record in [primary, *group] if record and record.get("summary")), "")
+    labels = [label for label in (publisher_severity(record) or _distro_label(record) for record in group) if label]
+    scores = [score for score in (numeric_score(record) for record in group) if score is not None]
+    if not labels:
+        labels = [label_from_score(max(scores) if scores else None)]
+    labels.sort(key=lambda label: RANK.get(label, 0), reverse=True)
+    return {
+        "id": primary_id,
+        "aliases": [i for i in ids if i != primary_id],
+        "summary": summary,
+        "severity": labels[0],
+        "score": max(scores) if scores else None,
+        "url": f"https://osv.dev/vulnerability/{primary_id}",
+    }
+
+
+def _advisory_ids(records):
+    return {summarize_runtime_group(group)["id"]: group for group in group_records(records)}
+
+
+def _sort_advisories(items):
+    items.sort(key=lambda item: (-RANK.get(item["severity"], 0), -(item["score"] if item["score"] is not None else -1), item["id"]))
+    return items
+
+
+def check_upstream(version, releases, cycle, query=None):
+    """An upstream CPython version against the PSF advisories in OSV, by release tag.
+
+    OSV returns nothing for a tag it does not know, so the version must be a published release.
+    Some tags (x.y.0, expedited releases) come back missing CVEs that the next patch still has.
+    Those are added back with inferred: true."""
+    query = query or (lambda tag: _osv_query_all({"name": CPYTHON_REPO, "ecosystem": "GIT"}, tag))
+    triple = _triple(version)
+    line = f"{triple[0]}.{triple[1]}" if triple else None
+    result = {"version": version, "build": "upstream", **line_status(line, cycle)}
+    published = published_versions(releases)
+    if triple not in published:
+        return {**result, "error": "not a published CPython release, so OSV cannot be trusted to know it"}
+    in_line = [item for item in published if item[:2] == triple[:2]]
+    latest = in_line[-1]
+    newer = [item for item in in_line if item > triple]
+    own = _advisory_ids(query(f"v{version}"))
+    inferred = {}
+    if newer:
+        nxt = _advisory_ids(query(f"v{_dotted(newer[0])}"))
+        inferred = {key: group for key, group in nxt.items() if key not in own}
+    still = set(_advisory_ids(query(f"v{_dotted(latest)}"))) if latest != triple else set(own)
+    advisories = []
+    for key, group in [*own.items(), *inferred.items()]:
+        item = summarize_runtime_group(group)
+        item["fixedInLine"] = key not in still
+        item["inferred"] = key in inferred
+        advisories.append(item)
+    security_only = result["supportPhase"] in {"security", "end-of-life"}
+    return {
+        **result,
+        "vulnerable": bool(advisories) or (security_only and bool(newer)),
+        "missedPatchReleases": [_dotted(item) for item in newer],
+        "upgradeTo": _dotted(latest) if newer else None,
+        "advisories": _sort_advisories(advisories),
+    }
+
+
+def os_release(text):
+    values = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip().strip('"')
+    return values
+
+
+def distro_ecosystem(values):
+    distro, version = values.get("ID"), values.get("VERSION_ID")
+    if distro == "ubuntu" and version:
+        return f"Ubuntu:{version}:LTS" if "LTS" in values.get("VERSION", "") else f"Ubuntu:{version}"
+    if distro == "debian" and version:
+        return f"Debian:{version}"
+    return None
+
+
+def _run(argv):
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return done.stdout if done.returncode == 0 else ""
+
+
+def dpkg_source(executable):
+    """(source package, source version) for a dpkg-owned file. None when dpkg is absent, "" when not owned."""
+    owner = _run(["dpkg", "-S", str(executable)])
+    if owner is None:
+        return None
+    if not owner.strip():
+        return ""
+    binary = owner.split(":", 1)[0].strip()
+    fields = _run(["dpkg-query", "-W", "-f=${source:Package}\t${source:Version}", binary])
+    if not fields or "\t" not in fields:
+        return ""
+    package, _, version = fields.strip().partition("\t")
+    return package, version
+
+
+def check_distro(version, package, package_version, ecosystem, cycle, query=None):
+    query = query or (lambda v: _osv_query_all({"name": package, "ecosystem": ecosystem}, v))
+    triple = _triple(version)
+    line = f"{triple[0]}.{triple[1]}" if triple else None
+    result = {
+        "version": version,
+        "build": "distro",
+        "package": package,
+        "packageVersion": package_version,
+        "ecosystem": ecosystem,
+        **line_status(line, cycle),
+    }
+    if not query(None):
+        return {**result, "error": f"OSV has no records for {package} in {ecosystem}, so it cannot be checked"}
+    advisories = []
+    for group in group_records(query(package_version)):
+        item = summarize_runtime_group(group)
+        events = [
+            event
+            for record in group
+            for affected in record.get("affected") or []
+            if (affected.get("package") or {}).get("ecosystem") == ecosystem
+            and (affected.get("package") or {}).get("name") == package
+            for rang in affected.get("ranges") or []
+            for event in rang.get("events") or []
+        ]
+        item["fixAvailable"] = any(event.get("fixed") for event in events)
+        advisories.append(item)
+    return {**result, "vulnerable": bool(advisories), "advisories": _sort_advisories(advisories)}
+
+
+def read_pyvenv(path):
+    values = {}
+    try:
+        for line in Path(path).read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                values[key.strip().lower()] = value.strip()
+    except OSError:
+        return None
+    version = values.get("version_info") or values.get("version")
+    if not version:
+        return None
+    return {"version": version, "home": values.get("home"), "implementation": values.get("implementation", "CPython")}
+
+
+def project_targets(root, lock_rels):
+    """.python-version and requires-python beside each uv.lock. Release line status only."""
+    targets = []
+    for rel in lock_rels:
+        folder = (root / rel).parent
+        pinned = folder / ".python-version"
+        if pinned.is_file():
+            first = next((line.strip() for line in pinned.read_text().splitlines() if line.strip() and not line.startswith("#")), "")
+            match = re.search(r"(\d+)\.(\d+)", first)
+            targets.append({"file": str(pinned.relative_to(root)), "kind": "python-version", "value": first, "line": f"{match[1]}.{match[2]}" if match else None})
+        try:
+            requires = tomllib.loads((root / rel).read_text()).get("requires-python")
+        except (OSError, tomllib.TOMLDecodeError):
+            requires = None
+        if requires:
+            match = re.search(r">=\s*(\d+)\.(\d+)", requires)
+            targets.append({"file": rel, "kind": "requires-python", "value": requires, "line": f"{match[1]}.{match[2]}" if match else None})
+    return targets
+
+
+def _interpreters(root, lock_rels, python_version):
+    if python_version is not None:
+        return [{"source": "flag", "version": python_version, "implementation": "CPython", "executable": None}]
+    found = []
+    for rel in lock_rels:
+        cfg = read_pyvenv((root / rel).parent / ".venv" / "pyvenv.cfg")
+        if cfg:
+            minor = ".".join(cfg["version"].split(".")[:2])
+            home = Path(cfg["home"]) if cfg.get("home") else None
+            executable = home / f"python{minor}" if home else None
+            found.append({"source": "venv", "venv": str(Path(rel).parent / ".venv"), "version": cfg["version"], "implementation": cfg["implementation"], "executable": executable})
+    if not found:
+        found.append({"source": "process", "version": ".".join(str(part) for part in sys.version_info[:3]), "implementation": sys.implementation.name, "executable": Path(sys.executable)})
+    unique = {}
+    for item in found:
+        unique.setdefault((item["version"], str(item["executable"])), item)
+    return list(unique.values())
+
+
+def scan_runtime(root, lock_rels, python_version=None):
+    try:
+        releases = request_json(PYTHON_RELEASES)
+        cycle = request_json(PYTHON_CYCLE)
+    except Exception as err:
+        error = f"python runtime not checked: {err}"
+        return {"name": "python", "error": error}, [error]
+    osv_ecosystem = None
+    try:
+        osv_ecosystem = distro_ecosystem(os_release(Path("/etc/os-release").read_text()))
+    except OSError:
+        pass
+    checked = []
+    for item in _interpreters(root, lock_rels, python_version):
+        base = {key: item[key] for key in ("source", "venv") if key in item}
+        if str(item["implementation"]).lower() != "cpython":
+            checked.append({**base, "version": item["version"], "note": f"{item['implementation']} is not CPython and was not checked"})
+            continue
+        if not _triple(item["version"]):
+            checked.append({**base, "version": item["version"], "error": "not an exact x.y.z version"})
+            continue
+        executable = item.get("executable")
+        owner = dpkg_source(executable.resolve()) if executable and executable.exists() else ""
+        eprint(f"python runtime: {item['version']} ({item['source']})")
+        try:
+            if owner:
+                if osv_ecosystem:
+                    checked.append({**base, **check_distro(item["version"], owner[0], owner[1], osv_ecosystem, cycle)})
+                else:
+                    checked.append({**base, "version": item["version"], "build": "distro", "error": "distro packages on this OS are not covered"})
+            elif owner is None and executable and str(executable.resolve()).startswith(("/usr/bin/", "/usr/lib/")):
+                checked.append({**base, "version": item["version"], "build": "distro", "error": "looks like a distro build, but dpkg is not available to identify the package"})
+            else:
+                checked.append({**base, **check_upstream(item["version"], releases, cycle)})
+        except Exception as err:
+            checked.append({**base, "version": item["version"], "error": f"not checked: {err}"})
+    targets = [{**target, **({} if not target["line"] else line_status(target["line"], cycle))} for target in project_targets(root, lock_rels)]
+    decided = [item.get("vulnerable") for item in checked if "vulnerable" in item]
+    runtime = {
+        "name": "python",
+        "recommendedLine": recommended_line(cycle),
+        "vulnerable": any(decided) if decided else None,
+        "interpreters": checked,
+        "targets": targets,
+    }
+    return runtime, [f"python runtime {item['version']}: {item['error']}" for item in checked if item.get("error")]
+
+
+def parse_args(argv):
+    args = {"root": None, "python_version": None}
+    items = iter(argv)
+    for arg in items:
+        if arg == "--python-version":
+            args["python_version"] = next(items, "")
+        elif arg.startswith("--python-version="):
+            args["python_version"] = arg.split("=", 1)[1]
+        elif args["root"] is None:
+            args["root"] = arg
+    return args
+
+
 def add_location(entry, location):
     for existing in entry["locations"]:
         if existing["lockfile"] != location["lockfile"]:
@@ -638,7 +963,7 @@ def add_location(entry, location):
     entry["locations"].append(location)
 
 
-def scan(root):
+def scan(root, python_version=None):
     root = Path(root).resolve()
     if not root.is_dir():
         fail(f"not a directory: {root}")
@@ -742,6 +1067,8 @@ def scan(root):
 
     findings.sort(key=sort_key)
     eprint(f"vulnerable versions: {len(findings)}")
+    runtime, runtime_warnings = scan_runtime(root, [item["rel"] for item in readable], python_version)
+    warnings.extend(runtime_warnings)
     report = {
         "ecosystem": ECOSYSTEM,
         "scannedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -750,6 +1077,7 @@ def scan(root):
         "packageVersions": len(packages),
         "vulnerablePackageVersions": len(findings),
         "findings": findings,
+        "runtime": runtime,
     }
     if warnings:
         report["warnings"] = warnings
@@ -758,7 +1086,8 @@ def scan(root):
 
 if __name__ == "__main__":
     try:
-        scan(sys.argv[1] if len(sys.argv) > 1 else Path.cwd())
+        args = parse_args(sys.argv[1:])
+        scan(args["root"] or Path.cwd(), args["python_version"])
     except SystemExit:
         raise
     except Exception as err:

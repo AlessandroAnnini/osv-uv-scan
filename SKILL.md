@@ -5,13 +5,15 @@ description: >-
   uv.lock versions against the OSV.dev API. Use whenever the user asks about
   vulnerabilities, CVEs, security advisories, dependency risk, or whether a
   Python project managed by uv is affected, including when they mention
-  osv.dev or a uv.lock. Do not use this skill for Node, npm, C#, or NuGet
-  projects.
+  osv.dev or a uv.lock. Also checks the CPython interpreter itself against the
+  Python Software Foundation advisories, so use it when the user asks whether
+  their Python version is vulnerable, out of support, or end of life. Do not
+  use this skill for Node, npm, C#, or NuGet projects.
 license: MIT
-compatibility: Requires Python 3.11 or newer and network access to https://api.osv.dev. Reads uv.lock version 1.
+compatibility: Requires Python 3.11 or newer and network access to https://api.osv.dev, https://www.python.org, and https://peps.python.org. Uses dpkg when present to identify Debian and Ubuntu Python packages. Reads uv.lock version 1.
 metadata:
   author: Alessandro Filippo Annini
-  version: "1.0.0"
+  version: "1.1.0"
   ecosystem: PyPI
 ---
 
@@ -31,6 +33,14 @@ python3 /absolute/path/to/osv-uv-scan/scripts/osv-scan.py /absolute/path/to/proj
 
 The script writes one JSON document to stdout and progress lines to stderr. It does not modify the project.
 
+The runtime check uses the interpreter in `.venv/pyvenv.cfg` beside each `uv.lock`. Without a venv it uses the Python that runs the script. To check the Python the project deploys on, such as the one in its Docker image, pass an exact version:
+
+```bash
+python3 /absolute/path/to/osv-uv-scan/scripts/osv-scan.py /absolute/path/to/project --python-version 3.12.3
+```
+
+Pass `--python-version` only with an exact `x.y.z` the user gave or the project pins exactly. Do not turn `3.12` or `requires-python` into a patch version. The flag checks upstream CPython, not a distro package.
+
 If stdout contains an `error` field, say what it says and stop. A missing lockfile is not a clean scan. If `warnings` is present, say each one. A warning is a lockfile or directory that could not be read, or an install that was not queried because it is not a registry package.
 
 ## What the script covers
@@ -38,6 +48,11 @@ If stdout contains an `error` field, say what it says and stop. A missing lockfi
 - Every `uv.lock` under the project root, except paths inside `.git`, `node_modules`, `site-packages`, or a virtualenv, and except files reached only through a symlink
 - `uv.lock` version 1. Production versions are those reachable from a project dependency, including an extra that dependency selects. Other locked versions, including dev groups, are the rest
 - Transitive dependencies, and the dependency edges needed for `introducedBy`
+
+Separately, the script checks the CPython runtime. The result is in `runtime`. It is not in `findings` and does not count toward `vulnerablePackageVersions`. It has two parts:
+
+- `interpreters`: each Python checked. An upstream build (uv-managed, pyenv, python.org, official Docker images) is matched against the [Python Software Foundation advisories](https://github.com/psf/advisory-database) in OSV by its CPython release tag, and against newer patch releases from python.org. A Debian or Ubuntu build is matched against that distro's records for its package and package version, because distros backport fixes without changing the Python version
+- `targets`: `.python-version` and `requires-python` beside each `uv.lock`, with the support phase and end-of-life date of their release line. `requires-python` is a declared minimum, not what runs
 
 It does not query the project itself, or git, path, or direct-URL installs recorded in the lock. It reads `uv.lock` only. Do not guess versions from anywhere else.
 
@@ -61,6 +76,15 @@ When advisories on the same version disagree by major (one fixed in 4.x, another
 Versions are ordered with PEP 440, so `1.0a1` is older than `1.0`, and `1.0` equals `1.0.0`. Package names are matched with PEP 503 normalization.
 
 Mention dev-only CRITICAL and HIGH findings in a short paragraph after the production table. Count the remaining MEDIUM and LOW production findings instead of listing every advisory. Call out a direct production dependency in that remainder when there is one.
+
+Then the runtime, in its own short section:
+
+- Name each interpreter checked, its `source`, and its `build`. When the source is `process`, say this is the Python that ran the scan, and may not be what the project runs on
+- For an upstream build with `vulnerable` true: the advisory count, the worst `severity`, how many patch releases it is behind, and `upgradeTo`. When `fixedInLine` is false, upgrading within the line does not fix that advisory. Say so. An `inferred` advisory was found on the next patch release and added back because OSV misses some release tags
+- For a distro build: the count, and how many have `fixAvailable` true, which means a newer distro package fixes them (`apt upgrade`). The rest have no released fix yet. Do not suggest a python.org patch version for a distro build
+- For a line that is end of life, in an interpreter or a target, say it is unsupported whatever the advisory count. Recommend `runtime.recommendedLine`. A `requires-python` minimum on an end-of-life line means the project still claims to support it
+- Severity comes from CVSS v3 or the distro's priority. Records with only CVSS v4 show `UNKNOWN`. Advisories have no platform data, so a Windows-only issue is listed on Linux too. Say that once when it matters
+- When an interpreter has `error` or `note`, say it was not checked and why
 
 This is a lockfile match against known advisories. It does not show whether the vulnerable code runs. Say that once.
 

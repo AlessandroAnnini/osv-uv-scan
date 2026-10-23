@@ -15,13 +15,19 @@ osv-uv-scan/
 └── references/report-schema.md
 ```
 
-Requires Python 3.11 or newer and network access to `https://api.osv.dev`. No packages to install.
+Requires Python 3.11 or newer and network access to `https://api.osv.dev`, `https://www.python.org`, and `https://peps.python.org`. No packages to install.
 
 ```bash
 python3 scripts/osv-scan.py /path/to/project
 ```
 
 Stdout is one JSON document. The fields match `osv-npm-scan` and are described in `references/report-schema.md`. `ecosystem` is `PyPI`.
+
+The report also has a separate `runtime` section for CPython itself. An upstream interpreter (from `.venv`, or the one running the script) is matched against the [Python Software Foundation advisories](https://github.com/psf/advisory-database) in OSV, and against newer patch releases on python.org. A Debian or Ubuntu Python is matched against that distro's own records, since distros backport fixes without changing the version. `.python-version` and `requires-python` get the support phase and end-of-life date of their line. To check another version, such as the one in your Docker image:
+
+```bash
+python3 scripts/osv-scan.py /path/to/project --python-version 3.12.3
+```
 
 ```bash
 python3 scripts/osv-scan.test.py
